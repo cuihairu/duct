@@ -1,12 +1,18 @@
 #include "duct/wire.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 
 #include "duct/protocol.h"
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
 #include <arpa/inet.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -14,10 +20,6 @@
 namespace duct::wire {
 
 void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]) {
-#if defined(_WIN32)
-  (void)h;
-  (void)out;
-#else
   std::uint32_t magic = htonl(h.magic);
   std::uint16_t version = htons(h.version);
   std::uint16_t header_len = htons(h.header_len);
@@ -29,14 +31,9 @@ void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]) {
   std::memcpy(out + 6, &header_len, 2);
   std::memcpy(out + 8, &payload_len, 4);
   std::memcpy(out + 12, &flags, 4);
-#endif
 }
 
 Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
-#if defined(_WIN32)
-  (void)in;
-  return Status::not_supported("wire decode not implemented on windows yet");
-#else
   FrameHeader h;
   std::uint32_t magic = 0;
   std::uint16_t version = 0;
@@ -69,17 +66,56 @@ Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]) {
     return Status::protocol_error("payload too large (frame)");
   }
   return h;
-#endif
 }
 
-#if !defined(_WIN32)
 namespace {
 
-Result<void> write_all(int fd, const std::uint8_t* p, std::size_t n) {
+#if defined(_WIN32)
+// Windows socket error handling
+inline Result<void> ensure_winsock() {
+  // Lazy, thread-safe Winsock init. Avoid WSACleanup to prevent shutdown ordering issues.
+  // 延迟、线程安全地初始化 Winsock；避免 WSACleanup 带来的退出阶段销毁顺序问题。
+  static int wsa_rc = [] {
+    WSADATA wsaData{};
+    return WSAStartup(MAKEWORD(2, 2), &wsaData);
+  }();
+  if (wsa_rc != 0) {
+    return Status::io_error("WSAStartup failed with error: " + std::to_string(wsa_rc));
+  }
+  return {};
+}
+
+inline int get_last_error() {
+  return WSAGetLastError();
+}
+inline bool interrupted(int error) {
+  return error == WSAEINTR;
+}
+#else
+// POSIX error handling
+inline int get_last_error() {
+  return errno;
+}
+inline bool interrupted(int error) {
+  return error == EINTR;
+}
+#endif
+
+Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
+#if defined(_WIN32)
+  auto wsa = ensure_winsock();
+  if (!wsa.ok()) return wsa;
+#endif
   while (n != 0) {
+#if defined(_WIN32)
+    SOCKET sock = static_cast<SOCKET>(fd);
+    int w = ::send(sock, reinterpret_cast<const char*>(p), static_cast<int>(n), 0);
+#else
     ssize_t w = ::send(fd, p, n, 0);
+#endif
     if (w < 0) {
-      if (errno == EINTR) continue;
+      int error = get_last_error();
+      if (interrupted(error)) continue;
       return Status::io_error("send() failed");
     }
     if (w == 0) return Status::closed("peer closed");
@@ -89,11 +125,21 @@ Result<void> write_all(int fd, const std::uint8_t* p, std::size_t n) {
   return {};
 }
 
-Result<void> read_exact(int fd, std::uint8_t* p, std::size_t n) {
+Result<void> read_exact(SocketHandle fd, std::uint8_t* p, std::size_t n) {
+#if defined(_WIN32)
+  auto wsa = ensure_winsock();
+  if (!wsa.ok()) return wsa;
+#endif
   while (n != 0) {
+#if defined(_WIN32)
+    SOCKET sock = static_cast<SOCKET>(fd);
+    int r = ::recv(sock, reinterpret_cast<char*>(p), static_cast<int>(n), 0);
+#else
     ssize_t r = ::recv(fd, p, n, 0);
+#endif
     if (r < 0) {
-      if (errno == EINTR) continue;
+      int error = get_last_error();
+      if (interrupted(error)) continue;
       return Status::io_error("recv() failed");
     }
     if (r == 0) return Status::closed("peer closed");
@@ -105,7 +151,7 @@ Result<void> read_exact(int fd, std::uint8_t* p, std::size_t n) {
 
 }  // namespace
 
-Result<void> write_frame(int fd, const Message& msg, std::uint32_t flags) {
+Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags) {
   if (msg.size() > kMaxFramePayload) {
     return Status::invalid_argument("message too large; enable fragmentation (todo)");
   }
@@ -124,7 +170,7 @@ Result<void> write_frame(int fd, const Message& msg, std::uint32_t flags) {
   return write_all(fd, msg.data(), msg.size());
 }
 
-Result<Message> read_frame(int fd) {
+Result<Message> read_frame(SocketHandle fd) {
   std::uint8_t hdr[kHeaderLen];
   auto st = read_exact(fd, hdr, sizeof(hdr));
   if (!st.ok()) return st.status();
@@ -139,7 +185,6 @@ Result<Message> read_frame(int fd) {
   }
   return Message::from_bytes(buf.data(), buf.size());
 }
-#endif
 
 }  // namespace duct::wire
 

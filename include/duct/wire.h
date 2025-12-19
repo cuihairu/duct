@@ -11,6 +11,17 @@ namespace duct::wire {
 constexpr std::size_t kHeaderLen = 16;
 constexpr std::size_t kMaxFramePayload = 64 * 1024;
 
+#if defined(_WIN32)
+using SocketHandle = std::uintptr_t;  // Compatible with WinSock's SOCKET (UINT_PTR); avoid 64-bit handle truncation. // 兼容 SOCKET，避免 64 位句柄截断。
+#else
+using SocketHandle = int;  // POSIX file descriptor. // POSIX 文件描述符。
+#endif
+
+// Use -1 as a sentinel across platforms.
+// Windows: INVALID_SOCKET is ~(0); we only use this for our own closed-state tracking.
+// 使用 -1 作为跨平台哨兵值；Windows 下 INVALID_SOCKET 是 ~(0)，这里仅用于内部关闭状态标记。
+constexpr SocketHandle kInvalidSocket = static_cast<SocketHandle>(-1);
+
 struct FrameHeader {
   std::uint32_t magic = 0;
   std::uint16_t version = 0;
@@ -23,10 +34,9 @@ struct FrameHeader {
 void encode_header(const FrameHeader& h, std::uint8_t out[kHeaderLen]);
 Result<FrameHeader> decode_header(const std::uint8_t in[kHeaderLen]);
 
-#if !defined(_WIN32)
-Result<void> write_frame(int fd, const Message& msg, std::uint32_t flags = 0);
-Result<Message> read_frame(int fd);
-#endif
+// Socket I/O functions (cross-platform)
+Result<void> write_frame(SocketHandle fd, const Message& msg, std::uint32_t flags = 0);
+Result<Message> read_frame(SocketHandle fd);
 
 }  // namespace duct::wire
 

@@ -11,6 +11,9 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#else
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 namespace {
@@ -74,7 +77,12 @@ static void test_shm_echo_one() {
   // Give the listener a moment to bind the bootstrap socket path.
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-  auto c = duct::dial("shm://duct_testbus");
+  // Disable QoS wrapper for transport-level tests.
+  // 关闭 QoS 包装层，专注验证底层 shm 传输语义。
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testbus", dial_opt);
   EXPECT_TRUE(c.ok());
   if (!c.ok()) return;
 
@@ -110,7 +118,10 @@ static void test_shm_backpressure_timeout() {
 
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
-  auto c = duct::dial("shm://duct_testbp");
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testbp", dial_opt);
   EXPECT_TRUE(c.ok());
   if (!c.ok()) {
     t.join();
@@ -145,6 +156,51 @@ static void test_shm_backpressure_timeout() {
   t.join();
 }
 
+static void test_shm_burst_without_receiver() {
+  auto lis_r = duct::listen("shm://duct_testburst");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto accepted = std::promise<duct::Result<std::unique_ptr<duct::Pipe>>>();
+  auto fut = accepted.get_future();
+  std::thread t([&] { accepted.set_value(lis_r.value()->accept()); });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("shm://duct_testburst", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) {
+    t.join();
+    return;
+  }
+
+  auto sr = fut.get();
+  EXPECT_TRUE(sr.ok());
+  if (!sr.ok()) {
+    t.join();
+    return;
+  }
+
+  // Do not recv on server side: client should be able to burst-send several messages
+  // without blocking on a fresh ring.
+  (void)sr.value();
+
+  duct::SendOptions opt;
+  opt.timeout = std::chrono::milliseconds(100);
+
+  for (int i = 0; i < 8; ++i) {
+    auto st = c.value()->send(duct::Message::from_string("x"), opt);
+    EXPECT_TRUE(st.ok());
+    if (!st.ok()) break;
+  }
+
+  lis_r.value()->close();
+  t.join();
+}
+
 static void test_wire_decode_rejects_bad_magic() {
   std::uint8_t hdr[duct::wire::kHeaderLen]{};
   auto decoded = duct::wire::decode_header(hdr);
@@ -156,8 +212,109 @@ static void test_wire_decode_rejects_bad_magic() {
 
 static void test_wire_socketpair_frames() {
 #if defined(_WIN32)
-  // TODO: Windows tests can use a loopback TCP socket or a named pipe.
-  return;
+  WSADATA wsaData{};
+  int wsa_rc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+  EXPECT_TRUE(wsa_rc == 0);
+  if (wsa_rc != 0) return;
+
+  SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  EXPECT_TRUE(listener != INVALID_SOCKET);
+  if (listener == INVALID_SOCKET) {
+    WSACleanup();
+    return;
+  }
+
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = 0;
+
+  int bind_rc = ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  EXPECT_TRUE(bind_rc == 0);
+  int listen_rc = ::listen(listener, 1);
+  EXPECT_TRUE(listen_rc == 0);
+  if (bind_rc != 0 || listen_rc != 0) {
+    closesocket(listener);
+    WSACleanup();
+    return;
+  }
+
+  sockaddr_in bound{};
+  int bound_len = sizeof(bound);
+  int getsock_rc = ::getsockname(listener, reinterpret_cast<sockaddr*>(&bound), &bound_len);
+  EXPECT_TRUE(getsock_rc == 0);
+  if (getsock_rc != 0) {
+    closesocket(listener);
+    WSACleanup();
+    return;
+  }
+
+  SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  EXPECT_TRUE(client != INVALID_SOCKET);
+  if (client == INVALID_SOCKET) {
+    closesocket(listener);
+    WSACleanup();
+    return;
+  }
+
+  sockaddr_in connect_addr{};
+  connect_addr.sin_family = AF_INET;
+  connect_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  connect_addr.sin_port = bound.sin_port;
+
+  int conn_rc = ::connect(client, reinterpret_cast<sockaddr*>(&connect_addr), sizeof(connect_addr));
+  EXPECT_TRUE(conn_rc == 0);
+  if (conn_rc != 0) {
+    closesocket(client);
+    closesocket(listener);
+    WSACleanup();
+    return;
+  }
+
+  SOCKET server = ::accept(listener, nullptr, nullptr);
+  EXPECT_TRUE(server != INVALID_SOCKET);
+  closesocket(listener);
+  if (server == INVALID_SOCKET) {
+    closesocket(client);
+    WSACleanup();
+    return;
+  }
+
+  auto writer = std::thread([&] {
+    (void)duct::wire::write_frame(static_cast<duct::wire::SocketHandle>(client),
+                                 duct::Message::from_string("one"));
+    (void)duct::wire::write_frame(static_cast<duct::wire::SocketHandle>(client),
+                                 duct::Message::from_string("two"));
+
+    std::string big(duct::wire::kMaxFramePayload, 'x');
+    (void)duct::wire::write_frame(static_cast<duct::wire::SocketHandle>(client),
+                                 duct::Message::from_string(big));
+    closesocket(client);
+  });
+
+  auto r1 = duct::wire::read_frame(static_cast<duct::wire::SocketHandle>(server));
+  EXPECT_TRUE(r1.ok());
+  if (r1.ok()) {
+    std::string s(reinterpret_cast<const char*>(r1.value().data()), r1.value().size());
+    EXPECT_EQ(s, "one");
+  }
+
+  auto r2 = duct::wire::read_frame(static_cast<duct::wire::SocketHandle>(server));
+  EXPECT_TRUE(r2.ok());
+  if (r2.ok()) {
+    std::string s(reinterpret_cast<const char*>(r2.value().data()), r2.value().size());
+    EXPECT_EQ(s, "two");
+  }
+
+  auto r3 = duct::wire::read_frame(static_cast<duct::wire::SocketHandle>(server));
+  EXPECT_TRUE(r3.ok());
+  if (r3.ok()) {
+    EXPECT_EQ(r3.value().size(), duct::wire::kMaxFramePayload);
+  }
+
+  closesocket(server);
+  writer.join();
+  WSACleanup();
 #else
   int fds[2]{-1, -1};
   int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
@@ -205,6 +362,7 @@ int main() {
   test_address_parse();
   test_shm_echo_one();
   test_shm_backpressure_timeout();
+  test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
 

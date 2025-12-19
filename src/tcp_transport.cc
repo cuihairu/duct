@@ -7,10 +7,11 @@
 #include <cstring>
 #include <memory>
 #include <string>
-#include <vector>
 
 #if defined(_WIN32)
-// TODO: Windows sockets/WSA startup + Named Pipe transport.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -22,97 +23,100 @@
 
 namespace duct {
 namespace {
-// Framing constants are in duct::wire.
 
-#if !defined(_WIN32)
-// Framing helpers live in duct::wire.
+#if defined(_WIN32)
+static Result<void> ensure_winsock() {
+  // Lazy, thread-safe Winsock init. We intentionally don't call WSACleanup here:
+  // global teardown can race with other static destructors using sockets.
+  // 延迟、线程安全地初始化 Winsock；这里刻意不调用 WSACleanup，避免进程退出阶段与其他静态析构竞态。
+  static int wsa_rc = [] {
+    WSADATA wsaData{};
+    return WSAStartup(MAKEWORD(2, 2), &wsaData);
+  }();
+  if (wsa_rc != 0) {
+    return Status::io_error("WSAStartup failed with error: " + std::to_string(wsa_rc));
+  }
+  return {};
+}
 #endif
+
+// Cross-platform socket close
+static void close_socket(wire::SocketHandle fd) {
+#if defined(_WIN32)
+  closesocket(static_cast<SOCKET>(fd));
+#else
+  ::close(fd);
+#endif
+}
 
 class TcpPipe final : public Pipe {
  public:
-  explicit TcpPipe(int fd) : fd_(fd) {}
+  explicit TcpPipe(wire::SocketHandle fd) : fd_(fd) {}
   ~TcpPipe() override { close(); }
 
   Result<void> send(const Message& msg, const SendOptions&) override {
-#if defined(_WIN32)
-    (void)msg;
-    return Status::not_supported("tcp not implemented on windows yet");
-#else
-    if (fd_ < 0) return Status::closed("pipe closed");
+    if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
     return wire::write_frame(fd_, msg, /*flags=*/0);
-#endif
   }
 
   Result<Message> recv(const RecvOptions&) override {
-#if defined(_WIN32)
-    return Status::not_supported("tcp not implemented on windows yet");
-#else
-    if (fd_ < 0) return Status::closed("pipe closed");
+    if (fd_ == wire::kInvalidSocket) return Status::closed("pipe closed");
     return wire::read_frame(fd_);
-#endif
   }
 
   void close() override {
-#if defined(_WIN32)
-    fd_ = -1;
-#else
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
+    if (fd_ != wire::kInvalidSocket) {
+      close_socket(fd_);
+      fd_ = wire::kInvalidSocket;
     }
-#endif
   }
 
  private:
-  int fd_ = -1;
+  wire::SocketHandle fd_ = wire::kInvalidSocket;
 };
 
 class TcpListener final : public Listener {
  public:
-  TcpListener(int fd, std::string host, std::uint16_t port) : fd_(fd), host_(std::move(host)), port_(port) {}
+  TcpListener(wire::SocketHandle fd, std::string host, std::uint16_t port)
+      : fd_(fd), host_(std::move(host)), port_(port) {}
   ~TcpListener() override { close(); }
 
   Result<std::unique_ptr<Pipe>> accept() override {
+    if (fd_ == wire::kInvalidSocket) return Status::closed("listener closed");
 #if defined(_WIN32)
-    return Status::not_supported("tcp not implemented on windows yet");
+    auto cfd = static_cast<wire::SocketHandle>(::accept(static_cast<SOCKET>(fd_), nullptr, nullptr));
 #else
-    if (fd_ < 0) return Status::closed("listener closed");
-    int cfd = ::accept(fd_, nullptr, nullptr);
-    if (cfd < 0) {
+    auto cfd = static_cast<wire::SocketHandle>(::accept(fd_, nullptr, nullptr));
+#endif
+    if (cfd == wire::kInvalidSocket) {
       return Status::io_error("accept() failed");
     }
     return std::unique_ptr<Pipe>(new TcpPipe(cfd));
-#endif
   }
 
   Result<std::string> local_address() const override {
-#if defined(_WIN32)
-    return Status::not_supported("tcp not implemented on windows yet");
-#else
-    if (fd_ < 0) return Status::closed("listener closed");
+    if (fd_ == wire::kInvalidSocket) return Status::closed("listener closed");
     return std::string("tcp://") + (host_.empty() ? "127.0.0.1" : host_) + ":" + std::to_string(port_);
-#endif
   }
 
   void close() override {
-#if defined(_WIN32)
-    fd_ = -1;
-#else
-    if (fd_ >= 0) {
-      ::close(fd_);
-      fd_ = -1;
+    if (fd_ != wire::kInvalidSocket) {
+      close_socket(fd_);
+      fd_ = wire::kInvalidSocket;
     }
-#endif
   }
 
  private:
-  int fd_ = -1;
+  wire::SocketHandle fd_ = wire::kInvalidSocket;
   std::string host_;
   std::uint16_t port_ = 0;
 };
 
-#if !defined(_WIN32)
-static Result<int> connect_tcp(const std::string& host, std::uint16_t port) {
+static Result<wire::SocketHandle> connect_tcp(const std::string& host, std::uint16_t port) {
+#if defined(_WIN32)
+  auto wsa = ensure_winsock();
+  if (!wsa.ok()) return wsa.status();
+#endif
   struct addrinfo hints {};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -124,29 +128,42 @@ static Result<int> connect_tcp(const std::string& host, std::uint16_t port) {
     return Status::io_error("getaddrinfo() failed");
   }
 
-  int fd = -1;
+  wire::SocketHandle fd = wire::kInvalidSocket;
   for (auto* p = res; p != nullptr; p = p->ai_next) {
-    fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (fd < 0) continue;
+    fd = static_cast<wire::SocketHandle>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+    if (fd == wire::kInvalidSocket) continue;
 
     int one = 1;
+#if defined(_WIN32)
+    SOCKET sock = static_cast<SOCKET>(fd);
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), static_cast<int>(sizeof(one)));
+#else
     (void)::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
 
+#if defined(_WIN32)
+    if (::connect(static_cast<SOCKET>(fd), p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0) {
+#else
     if (::connect(fd, p->ai_addr, p->ai_addrlen) == 0) {
+#endif
       break;
     }
-    ::close(fd);
-    fd = -1;
+    close_socket(fd);
+    fd = wire::kInvalidSocket;
   }
 
   ::freeaddrinfo(res);
-  if (fd < 0) {
+  if (fd == wire::kInvalidSocket) {
     return Status::io_error("connect() failed");
   }
   return fd;
 }
 
-static Result<int> listen_tcp(const std::string& host, std::uint16_t port, int backlog) {
+static Result<wire::SocketHandle> listen_tcp(const std::string& host, std::uint16_t port, int backlog) {
+#if defined(_WIN32)
+  auto wsa = ensure_winsock();
+  if (!wsa.ok()) return wsa.status();
+#endif
   struct addrinfo hints {};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
@@ -160,37 +177,41 @@ static Result<int> listen_tcp(const std::string& host, std::uint16_t port, int b
     return Status::io_error("getaddrinfo() failed");
   }
 
-  int fd = -1;
+  wire::SocketHandle fd = wire::kInvalidSocket;
   for (auto* p = res; p != nullptr; p = p->ai_next) {
-    fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-    if (fd < 0) continue;
+    fd = static_cast<wire::SocketHandle>(::socket(p->ai_family, p->ai_socktype, p->ai_protocol));
+    if (fd == wire::kInvalidSocket) continue;
 
     int one = 1;
+#if defined(_WIN32)
+    SOCKET sock = static_cast<SOCKET>(fd);
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), static_cast<int>(sizeof(one)));
+#else
     (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+#endif
 
+#if defined(_WIN32)
+    if (::bind(static_cast<SOCKET>(fd), p->ai_addr, static_cast<int>(p->ai_addrlen)) == 0 &&
+        ::listen(static_cast<SOCKET>(fd), backlog) == 0) {
+#else
     if (::bind(fd, p->ai_addr, p->ai_addrlen) == 0 && ::listen(fd, backlog) == 0) {
+#endif
       break;
     }
-    ::close(fd);
-    fd = -1;
+    close_socket(fd);
+    fd = wire::kInvalidSocket;
   }
 
   ::freeaddrinfo(res);
-  if (fd < 0) {
+  if (fd == wire::kInvalidSocket) {
     return Status::io_error("bind/listen failed");
   }
   return fd;
 }
-#endif
 
 }  // namespace
 
 Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const ListenOptions& opt) {
-#if defined(_WIN32)
-  (void)addr;
-  (void)opt;
-  return Status::not_supported("tcp not implemented on windows yet");
-#else
   auto fd = listen_tcp(addr.host, addr.port, opt.backlog);
   if (!fd.ok()) return fd.status();
 
@@ -199,7 +220,11 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
   if (effective_port == 0) {
     sockaddr_storage ss{};
     socklen_t slen = sizeof(ss);
+#if defined(_WIN32)
+    if (::getsockname(static_cast<SOCKET>(fd.value()), reinterpret_cast<sockaddr*>(&ss), &slen) == 0) {
+#else
     if (::getsockname(fd.value(), reinterpret_cast<sockaddr*>(&ss), &slen) == 0) {
+#endif
       if (ss.ss_family == AF_INET) {
         auto* sin = reinterpret_cast<sockaddr_in*>(&ss);
         effective_port = ntohs(sin->sin_port);
@@ -211,20 +236,13 @@ Result<std::unique_ptr<Listener>> tcp_listen(const TcpAddress& addr, const Liste
   }
 
   return std::unique_ptr<Listener>(new TcpListener(fd.value(), addr.host, effective_port));
-#endif
 }
 
 Result<std::unique_ptr<Pipe>> tcp_dial(const TcpAddress& addr, const DialOptions& opt) {
-#if defined(_WIN32)
-  (void)addr;
-  (void)opt;
-  return Status::not_supported("tcp not implemented on windows yet");
-#else
   (void)opt;
   auto fd = connect_tcp(addr.host, addr.port);
   if (!fd.ok()) return fd.status();
   return std::unique_ptr<Pipe>(new TcpPipe(fd.value()));
-#endif
 }
 
 }  // namespace duct

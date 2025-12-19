@@ -1,0 +1,55 @@
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+#include "duct/duct.h"
+#include "duct/message.h"
+#include "duct/status.h"
+
+namespace duct {
+
+// Internal queue entry with timestamp for TTL
+struct QueuedMessage {
+  Message message;
+  std::chrono::steady_clock::time_point timestamp;
+
+  QueuedMessage(const Message& msg)
+    : message(msg), timestamp(std::chrono::steady_clock::now()) {}
+};
+
+class QosPipe : public Pipe {
+ public:
+  QosPipe(std::unique_ptr<Pipe> underlying, const QosOptions& qos);
+  ~QosPipe() override;
+
+  Result<void> send(const Message& msg, const SendOptions& opt) override;
+  Result<Message> recv(const RecvOptions& opt) override;
+  void close() override;
+
+ private:
+  // Background thread for processing send queue
+  void send_worker();
+  bool can_send_message(const QueuedMessage& queued_msg) const;
+
+  std::unique_ptr<Pipe> underlying_;
+  QosOptions qos_;
+
+  // Send queue management
+  std::deque<QueuedMessage> send_queue_;
+  std::mutex send_mutex_;
+  std::condition_variable send_cv_;
+  std::thread send_thread_;
+  std::atomic<bool> running_{false};
+
+  // Current queue sizes
+  std::atomic<size_t> send_bytes_{0};
+  std::atomic<size_t> send_count_{0};
+};
+
+}  // namespace duct

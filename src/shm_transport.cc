@@ -1,5 +1,17 @@
 #include "duct/duct.h"
 
+#if defined(_WIN32)
+// Windows implementation is in win_shm.cc
+// Windows shared memory functions are declared here but implemented in win_shm.cc
+namespace duct {
+
+// Forward declarations for Windows shared memory functions (implemented in win_shm.cc)
+Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const ListenOptions& opt);
+Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt);
+
+}  // namespace duct
+
+#else
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -14,9 +26,6 @@
 #include <string_view>
 #include <vector>
 
-#if defined(_WIN32)
-// TODO: Windows shared memory + event objects.
-#else
 #include <fcntl.h>
 #include <semaphore.h>
 #include <sys/mman.h>
@@ -25,7 +34,6 @@
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
-#endif
 
 namespace duct {
 namespace {
@@ -476,27 +484,15 @@ class ShmListener final : public Listener {
 };
 #endif  // !_WIN32
 
-}  // namespace
-
+// Linux/Unix implementation functions
 Result<std::unique_ptr<Listener>> shm_listen(const std::string& name, const ListenOptions& opt) {
-#if defined(_WIN32)
-  (void)name;
-  (void)opt;
-  return Status::not_supported("shm not implemented on windows yet");
-#else
   ShmNames n = make_names(name, "0000000000000000");
   auto fd = uds_listen(n.bootstrap_path, opt.backlog);
   if (!fd.ok()) return fd.status();
   return std::unique_ptr<Listener>(new ShmListener(std::move(n), fd.value()));
-#endif
 }
 
 Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOptions& opt) {
-#if defined(_WIN32)
-  (void)name;
-  (void)opt;
-  return Status::not_supported("shm not implemented on windows yet");
-#else
   (void)opt;
   std::string connid = random_conn_id_hex16();
   ShmNames n = make_names(name, connid);
@@ -528,7 +524,7 @@ Result<std::unique_ptr<Pipe>> shm_dial(const std::string& name, const DialOption
   }
 
   return std::unique_ptr<Pipe>(new ShmPipe(created.value(), std::move(n), /*owner=*/true, /*is_client=*/true));
-#endif
 }
 
 }  // namespace duct
+#endif  // !_WIN32
