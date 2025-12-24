@@ -1,6 +1,8 @@
 #include "duct/duct.h"
 #include "duct/wire.h"
 
+#include <atomic>
+#include <csignal>
 #include <chrono>
 #include <future>
 #include <iostream>
@@ -59,6 +61,18 @@ static void test_address_parse() {
     EXPECT_EQ(a.value().scheme, duct::Scheme::kShm);
     EXPECT_EQ(a.value().name, "gamebus");
   }
+  {
+    auto a = duct::Address::parse("uds:///tmp/duct.sock");
+    EXPECT_TRUE(a.ok());
+    EXPECT_EQ(a.value().scheme, duct::Scheme::kUds);
+    EXPECT_EQ(a.value().name, "/tmp/duct.sock");
+  }
+  {
+    auto a = duct::Address::parse("pipe://mypipe");
+    EXPECT_TRUE(a.ok());
+    EXPECT_EQ(a.value().scheme, duct::Scheme::kPipe);
+    EXPECT_EQ(a.value().name, "mypipe");
+  }
 }
 
 static void test_shm_echo_one() {
@@ -105,6 +119,58 @@ static void test_shm_echo_one() {
   }
 
   lis_r.value()->close();
+}
+
+static void test_pipe_echo_one() {
+#if !defined(_WIN32)
+  auto lis_r = duct::listen("pipe://duct_testpipe_echo");
+  EXPECT_TRUE(!lis_r.ok());
+  if (!lis_r.ok()) {
+    EXPECT_EQ(lis_r.status().code(), duct::StatusCode::kNotSupported);
+  }
+  return;
+#else
+  auto lis_r = duct::listen("pipe://duct_testpipe_echo");
+  EXPECT_TRUE(lis_r.ok());
+  if (!lis_r.ok()) return;
+
+  auto server = std::async(std::launch::async, [&]() -> duct::Result<void> {
+    auto p = lis_r.value()->accept();
+    if (!p.ok()) return p.status();
+    auto msg = p.value()->recv({});
+    if (!msg.ok()) return msg.status();
+    return p.value()->send(msg.value(), {});
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+  duct::DialOptions dial_opt;
+  dial_opt.qos.snd_hwm_bytes = 0;
+  dial_opt.qos.rcv_hwm_bytes = 0;
+  auto c = duct::dial("pipe://duct_testpipe_echo", dial_opt);
+  EXPECT_TRUE(c.ok());
+  if (!c.ok()) return;
+
+  auto st = c.value()->send(duct::Message::from_string("hello"), {});
+  EXPECT_TRUE(st.ok());
+  if (!st.ok()) return;
+
+  auto echoed = c.value()->recv({});
+  EXPECT_TRUE(echoed.ok());
+  if (!echoed.ok()) return;
+
+  std::string s(reinterpret_cast<const char*>(echoed.value().data()), echoed.value().size());
+  EXPECT_EQ(s, "hello");
+
+  auto sst = server.wait_for(std::chrono::seconds(1));
+  EXPECT_TRUE(sst == std::future_status::ready);
+  if (sst == std::future_status::ready) {
+    auto sr = server.get();
+    EXPECT_TRUE(sr.ok());
+  }
+
+  lis_r.value()->close();
+#endif
 }
 
 static void test_shm_backpressure_timeout() {
@@ -154,6 +220,34 @@ static void test_shm_backpressure_timeout() {
 
   lis_r.value()->close();
   t.join();
+}
+
+static void test_wire_write_no_sigpipe_on_macos() {
+#if !defined(__APPLE__)
+  return;
+#elif defined(_WIN32)
+  return;
+#else
+  static std::atomic<int> sigpipe_count{0};
+  auto handler = +[](int) { sigpipe_count.fetch_add(1, std::memory_order_relaxed); };
+
+  int fds[2]{-1, -1};
+  int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fds);
+  EXPECT_TRUE(rc == 0);
+  if (rc != 0) return;
+
+  ::close(fds[1]);
+
+  auto old = std::signal(SIGPIPE, handler);
+  sigpipe_count.store(0, std::memory_order_relaxed);
+
+  auto st = duct::wire::write_frame(fds[0], duct::Message::from_string("x"));
+  EXPECT_TRUE(!st.ok());
+  EXPECT_EQ(sigpipe_count.load(std::memory_order_relaxed), 0);
+
+  (void)std::signal(SIGPIPE, old);
+  ::close(fds[0]);
+#endif
 }
 
 static void test_shm_burst_without_receiver() {
@@ -361,10 +455,12 @@ static void test_wire_socketpair_frames() {
 int main() {
   test_address_parse();
   test_shm_echo_one();
+  test_pipe_echo_one();
   test_shm_backpressure_timeout();
   test_shm_burst_without_receiver();
   test_wire_decode_rejects_bad_magic();
   test_wire_socketpair_frames();
+  test_wire_write_no_sigpipe_on_macos();
 
   if (g_failures != 0) {
     std::cerr << "FAIL (" << g_failures << ")\n";

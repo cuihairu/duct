@@ -1,0 +1,36 @@
+#pragma once
+
+#include <chrono>
+#include <cstdint>
+
+#include "duct/status.h"
+
+namespace duct::socket_utils {
+
+// Cross-platform socket handle type.
+#if defined(_WIN32)
+using socket_t = std::uintptr_t;  // compatible with WinSock SOCKET (UINT_PTR) without including winsock headers.
+inline constexpr socket_t kInvalidSocket = static_cast<socket_t>(static_cast<std::uintptr_t>(-1));
+#else
+using socket_t = int;
+inline constexpr socket_t kInvalidSocket = -1;
+#endif
+
+// Initialize platform networking subsystem (WSAStartup on Windows).
+Result<void> ensure_networking();
+
+// Wait for fd to become readable within timeout.
+// Returns Ok if readable, Timeout if timed out, or IoError on failure.
+Result<void> wait_readable(socket_t fd, std::chrono::milliseconds timeout);
+
+// Wait for fd to become writable within timeout.
+// Returns Ok if writable, Timeout if timed out, or IoError on failure.
+Result<void> wait_writable(socket_t fd, std::chrono::milliseconds timeout);
+
+// Set socket to non-blocking mode.
+Result<void> set_nonblocking(socket_t fd, bool nonblock);
+
+// Close a socket handle.
+Result<void> close_socket(socket_t fd);
+
+}  // namespace duct::socket_utils

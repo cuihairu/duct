@@ -35,6 +35,10 @@ else()
   target_compile_options(duct PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+if (WIN32)
+  target_link_libraries(duct PUBLIC ws2_32)
+endif()
+
 if (DUCT_BUILD_EXAMPLES)
   add_executable(duct_echo_server examples/duct_echo_server.cc)
   target_link_libraries(duct_echo_server PRIVATE duct)

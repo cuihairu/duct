@@ -106,6 +106,11 @@ Result<void> write_all(SocketHandle fd, const std::uint8_t* p, std::size_t n) {
   auto wsa = ensure_winsock();
   if (!wsa.ok()) return wsa;
 #endif
+#if defined(__APPLE__)
+  // Avoid SIGPIPE on macOS when writing to a closed socket.
+  int one = 1;
+  (void)::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
   while (n != 0) {
 #if defined(_WIN32)
     SOCKET sock = static_cast<SOCKET>(fd);
@@ -187,4 +192,3 @@ Result<Message> read_frame(SocketHandle fd) {
 }
 
 }  // namespace duct::wire
-

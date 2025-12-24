@@ -1,0 +1,143 @@
+name: Nightly Release
+
+on:
+  schedule:
+    # Run at 00:00 UTC every day
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Allow manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            artifact_name: duct-linux-x64
+            c_compiler: gcc
+            cpp_compiler: g++
+          - os: ubuntu-latest
+            target: linux-x64-clang
+            artifact_name: duct-linux-x64-clang
+            c_compiler: clang
+            cpp_compiler: clang++
+          - os: windows-latest
+            target: windows-x64
+            artifact_name: duct-windows-x64
+            c_compiler: cl
+            cpp_compiler: cl
+          - os: macos-latest
+            target: macos-arm64
+            artifact_name: duct-macos-arm64
+            c_compiler: clang
+            cpp_compiler: clang++
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_CXX_COMPILER=${{ matrix.cpp_compiler }}
+          -DCMAKE_C_COMPILER=${{ matrix.c_compiler }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DDUCT_BUILD_EXAMPLES=ON
+          -DDUCT_BUILD_TESTS=ON
+          -S .
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Test
+        working-directory: build
+        run: ctest --build-config Release --output-on-failure
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/${{ matrix.artifact_name }}
+          cp -r include dist/${{ matrix.artifact_name }}/
+          cp build/libduct.a dist/${{ matrix.artifact_name }}/
+          cp build/duct_echo_server dist/${{ matrix.artifact_name }}/
+          cp build/duct_echo_client dist/${{ matrix.artifact_name }}/
+          cp README.md dist/${{ matrix.artifact_name }}/ || true
+          cp LICENSE dist/${{ matrix.artifact_name }}/ || true
+          cd dist && tar -czvf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/${{ matrix.artifact_name }}
+          Copy-Item -Recurse include dist/${{ matrix.artifact_name }}/
+          Copy-Item build/Release/duct.lib dist/${{ matrix.artifact_name }}/
+          Copy-Item build/Release/duct_echo_server.exe dist/${{ matrix.artifact_name }}/
+          Copy-Item build/Release/duct_echo_client.exe dist/${{ matrix.artifact_name }}/
+          if (Test-Path README.md) { Copy-Item README.md dist/${{ matrix.artifact_name }}/ }
+          if (Test-Path LICENSE) { Copy-Item LICENSE dist/${{ matrix.artifact_name }}/ }
+          Compress-Archive -Path dist/${{ matrix.artifact_name }} -DestinationPath dist/${{ matrix.artifact_name }}.zip
+
+      - name: Upload Artifact (Unix)
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.tar.gz
+
+      - name: Upload Artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate release tag
+        id: tag
+        run: echo "tag=nightly-$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
+      - name: Delete existing nightly release
+        run: |
+          gh release delete ${{ steps.tag.outputs.tag }} --yes || true
+          git push origin :refs/tags/${{ steps.tag.outputs.tag }} || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create nightly release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Nightly Build ${{ steps.tag.outputs.tag }}
+          body: |
+            Automated nightly build from main branch.
+
+            **Build Date:** $(date +'%Y-%m-%d %H:%M:%S UTC')
+            **Commit:** ${{ github.sha }}
+
+            ## Artifacts
+            - `duct-linux-x64.tar.gz` - Linux x64 (GCC)
+            - `duct-linux-x64-clang.tar.gz` - Linux x64 (Clang)
+            - `duct-windows-x64.zip` - Windows x64 (MSVC)
+            - `duct-macos-arm64.tar.gz` - macOS ARM64 (Clang)
+
+            ⚠️ This is an automated nightly build and may be unstable.
+          prerelease: true
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip

@@ -66,7 +66,11 @@ Result<Address> Address::parse(std::string s) {
   }
 
   if (a.scheme == Scheme::kUds) {
-    return Status::not_supported("uds scheme not implemented yet");
+    if (sv.empty()) {
+      return Status::invalid_argument("uds address must be non-empty path");
+    }
+    a.name = std::string(sv);  // Store socket path in name field
+    return a;
   }
 
   return Status::invalid_argument("unknown scheme: " + a.scheme_text);

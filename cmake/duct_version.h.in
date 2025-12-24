@@ -1,0 +1,48 @@
+#pragma once
+
+#define DUCT_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define DUCT_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define DUCT_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define DUCT_VERSION "@PROJECT_VERSION@"
+#define DUCT_VERSION_ID (@PROJECT_VERSION_MAJOR@ * 10000 + @PROJECT_VERSION_MINOR@ * 100 + @PROJECT_VERSION_PATCH@)
+
+namespace duct {
+
+// 版本信息结构
+struct Version {
+  int major = DUCT_VERSION_MAJOR;
+  int minor = DUCT_VERSION_MINOR;
+  int patch = DUCT_VERSION_PATCH;
+
+  // 版本比较
+  constexpr bool operator==(const Version& other) const {
+    return major == other.major && minor == other.minor && patch == other.patch;
+  }
+
+  constexpr bool operator!=(const Version& other) const {
+    return !(*this == other);
+  }
+
+  constexpr bool operator<(const Version& other) const {
+    if (major != other.major) return major < other.major;
+    if (minor != other.minor) return minor < other.minor;
+    return patch < other.patch;
+  }
+
+  constexpr bool operator<=(const Version& other) const {
+    return *this < other || *this == other;
+  }
+
+  constexpr bool operator>(const Version& other) const {
+    return !(*this <= other);
+  }
+
+  constexpr bool operator>=(const Version& other) const {
+    return !(*this < other);
+  }
+};
+
+// 运行时版本
+inline Version version() { return Version{}; }
+
+}  // namespace duct

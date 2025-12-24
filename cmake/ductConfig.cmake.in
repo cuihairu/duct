@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# 查找依赖（如果将来有的话）
+
+# 包含目标导出
+include("${CMAKE_CURRENT_LIST_DIR}/ductTargets.cmake")
+
+# 设置变量供 find_package 检查
+check_required_components(duct)

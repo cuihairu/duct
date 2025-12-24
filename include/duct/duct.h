@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -24,6 +25,34 @@ enum class Reliability {
   kAtLeastOnce,
 };
 
+struct ReconnectPolicy {
+  // If enabled, dial() returns a pipe that connects/reconnects automatically.
+  bool enabled = false;
+
+  // Initial reconnect delay after a disconnect.
+  std::chrono::milliseconds initial_delay{100};
+  // Maximum backoff delay between attempts.
+  std::chrono::milliseconds max_delay{30'000};
+  // Exponential backoff multiplier.
+  double backoff_multiplier = 2.0;
+  // Maximum reconnect attempts; 0 means retry forever.
+  int max_attempts = 0;
+
+  // Heartbeat/keepalive interval. For tcp:// this maps to OS TCP keepalive settings.
+  // Zero means disabled.
+  std::chrono::milliseconds heartbeat_interval{5'000};
+};
+
+enum class ConnectionState {
+  kConnecting = 0,
+  kConnected,
+  kDisconnected,
+  kReconnecting,
+  kClosed,
+};
+
+using ConnectionCallback = std::function<void(ConnectionState, const std::string& reason)>;
+
 struct QosOptions {
   // Bytes are more stable than msg-count when payload sizes vary.
   std::size_t snd_hwm_bytes = 4 * 1024 * 1024;
@@ -32,6 +61,9 @@ struct QosOptions {
 
   // Per-message TTL; zero means disabled.
   std::chrono::milliseconds ttl{0};
+
+  // Close linger/drain time for queued outbound messages; zero means best-effort immediate close.
+  std::chrono::milliseconds linger{0};
 
   Reliability reliability = Reliability::kAtMostOnce;
 };
@@ -67,8 +99,12 @@ class Listener {
 };
 
 struct DialOptions {
+  // Dial timeout for a single connection attempt. For reconnect-enabled dials, a timeout of 0 uses
+  // an internal default so the reconnect worker remains stoppable via close().
   std::chrono::milliseconds timeout{0};
   QosOptions qos{};
+  ReconnectPolicy reconnect{};
+  ConnectionCallback on_state_change{};
 };
 
 struct ListenOptions {
